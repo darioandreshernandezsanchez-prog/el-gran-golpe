@@ -13,7 +13,7 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 ODDS_API_KEY = os.getenv("ODDS_API_KEY", "").strip()
-ODDS_API_BASE = os.getenv("ODDS_API_BASE_URL", "https://api.the-odds-api.com").rstrip("/")
+ODDS_API_BASE = os.getenv("ODDS_API_BASE", "https://api.the-odds-api.com").rstrip("/")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 POLL_SECONDS = max(300, int(os.getenv("POLL_SECONDS", "900")))
 MIN_ODDS = float(os.getenv("MIN_ODDS", "1.70"))
