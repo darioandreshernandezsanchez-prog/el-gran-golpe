@@ -1,4 +1,4 @@
-"""El Gran Golpe v1.4 — private Telegram sports-odds scanner with Gemini.
+"""El Gran Golpe v1.6 — private Telegram sports-odds scanner with Gemini.
 Alerts are statistical screening signals, not guarantees. This bot never places bets.
 """
 from __future__ import annotations
@@ -507,7 +507,7 @@ def main() -> None:
         log.warning("Falta ODDS_API_KEY: el bot seguirá disponible, pero no podrá escanear cuotas.")
     offset = 0
     last_scan = time.time()  # Wait one full interval after startup before automatic scan.
-    log.info("El Gran Golpe v1.5 + Gemini iniciado; intervalo automático %ss; modelo %s", POLL_SECONDS, GEMINI_MODEL)
+    log.info("El Gran Golpe v1.6 + Gemini iniciado; intervalo automático %ss; modelo %s", POLL_SECONDS, GEMINI_MODEL)
     while True:
         try:
             updates = telegram("getUpdates", {
@@ -522,10 +522,14 @@ def main() -> None:
             message = str(exc)
             log.warning("Telegram polling: %s", message)
             if "409" in message or "Conflict" in message:
-                # Telegram only allows one active getUpdates poller per bot token.
-                # Exit instead of endlessly retrying and hiding the duplicate process.
-                log.critical("409 Conflict: hay otro proceso usando este TELEGRAM_BOT_TOKEN. Detén el duplicado en Render o en tu equipo.")
-                raise SystemExit("Telegram 409: otro proceso está usando el mismo token.")
+                # Avoid crashing and triggering a Render restart loop. Telegram still
+                # permits only one getUpdates poller per token; back off and retry slowly.
+                log.error(
+                    "Telegram 409: otro proceso está usando el mismo token. "
+                    "Se pausa 60 s para evitar un ciclo de reinicios; el conflicto externo "
+                    "debe desaparecer para que este bot reciba mensajes."
+                )
+                time.sleep(60)
             else:
                 time.sleep(4)
 
