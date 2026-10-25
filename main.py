@@ -26,22 +26,28 @@ ODDS_API_BASE = os.getenv(
 ).rstrip("/")
 AUTHORIZED_USER_ID = os.getenv("AUTHORIZED_USER_ID", "1572804298").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip().removeprefix("models/")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-POLL_SECONDS = max(300, int(os.getenv("POLL_SECONDS", "900")))
+# Six-hour default to protect a limited odds API quota.
+POLL_SECONDS = max(300, int(os.getenv("POLL_SECONDS", "21600")))
 MIN_ODDS = float(os.getenv("MIN_ODDS", "1.70"))
 MIN_EDGE = float(os.getenv("MIN_EDGE", "0.03"))
 MIN_BOOKMAKERS = max(2, int(os.getenv("MIN_BOOKMAKERS", "3")))
-MAX_SPORTS_PER_SCAN = max(1, int(os.getenv("MAX_SPORTS_PER_SCAN", "4")))
+MAX_SPORTS_PER_SCAN = max(1, int(os.getenv("MAX_SPORTS_PER_SCAN", "12")))
 DB_PATH = os.getenv("DB_PATH", "el_gran_golpe.sqlite3")
 REGIONS = os.getenv("ODDS_REGIONS", "eu")
 DEFAULT_SPORTS = (
-    "basketball_nba,soccer_epl,soccer_spain_la_liga,"
-    "soccer_uefa_champs_league"
+    "soccer_epl,soccer_spain_la_liga,soccer_germany_bundesliga,"
+    "soccer_italy_serie_a,soccer_france_ligue_one,soccer_netherlands_eredivisie,"
+    "soccer_portugal_primeira_liga,soccer_uefa_champs_league,"
+    "soccer_uefa_europa_league,soccer_uefa_europa_conference_league,"
+    "soccer_england_efl_champ,soccer_spl,basketball_nba"
 )
 SPORTS = [s.strip() for s in os.getenv("SPORT_KEYS", DEFAULT_SPORTS).split(",") if s.strip()]
-MARKETS = os.getenv("ODDS_MARKETS", "h2h")
+# Standard markets: winner, handicap and totals. Extra soccer markets (BTTS/corners/cards)
+# depend on the provider endpoint and subscription; configure only if your API key supports them.
+MARKETS = os.getenv("ODDS_MARKETS", "h2h,totals,spreads")
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -400,27 +406,47 @@ def gemini_reply(user_request: str, chat_id: str | int) -> None:
         "generationConfig": {"temperature": 0.25, "maxOutputTokens": 800}
     }).encode("utf-8")
     req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"}, method="POST")
+    data = None
+    last_error = "error desconocido"
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=22) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            break
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            last_error = f"HTTP {exc.code}: {body[:350]}"
+            log.warning("Fallo Gemini intento %s/3: %s", attempt + 1, last_error)
+            if exc.code not in (429, 500, 502, 503, 504) or attempt == 2:
+                break
+        except Exception as exc:
+            last_error = str(exc)
+            log.warning("Fallo Gemini intento %s/3: %s", attempt + 1, last_error)
+            if attempt == 2:
+                break
+        time.sleep(1.5 * (attempt + 1))
+
+    if data is None:
+        log.error("Gemini no respondió tras reintentos: %s", last_error)
+        send_message(chat_id, f"Gemini no respondió tras 3 intentos ({last_error[:180]}). Comprueba GEMINI_API_KEY y GEMINI_MODEL en Render.")
+        return
     try:
-        with urllib.request.urlopen(req, timeout=35) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
         parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
         answer = "\n".join(part.get("text", "") for part in parts if part.get("text"))
         if not answer.strip():
             feedback = data.get("promptFeedback", {})
-            raise RuntimeError(f"Respuesta vacía; promptFeedback={feedback}")
+            log.warning("Respuesta Gemini vacía: %s", feedback)
+            send_message(chat_id, "Gemini respondió sin texto. Prueba otra vez; si persiste, revisa los logs de Render.")
+            return
         send_message(chat_id, "🤖 EL GRAN GOLPE · GEMINI\n\n" + answer.strip())
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        log.warning("Fallo Gemini HTTP %s: %s", exc.code, body[:500])
-        send_message(chat_id, f"Gemini devolvió HTTP {exc.code}. Revisa los logs de Render; no es un error de cuotas deportivas.")
     except Exception as exc:
-        log.warning("Fallo Gemini: %s", exc)
-        send_message(chat_id, "No pude consultar Gemini. Revisa los logs de Render para ver el error exacto.")
+        log.warning("No se pudo procesar respuesta Gemini: %s", exc)
+        send_message(chat_id, "Gemini respondió, pero no pude leer la respuesta. Revisa los logs de Render.")
 
 
 def help_text() -> str:
     return (
-        "🏁 EL GRAN GOLPE v1.4 + GEMINI\n\n"
+        "🏁 EL GRAN GOLPE v1.5 + GEMINI\n\n"
         "/start — activar mensajes en este chat\n/scan — consultar cuotas (consume créditos de la API)\n"
         "/pick_hoy — analizar el mejor candidato guardado\n/combo — combinada con señales guardadas\n"
         "/status — estado de configuración\n/results — rendimiento registrado\n"
@@ -428,8 +454,8 @@ def help_text() -> str:
         f"Cuota mínima: {MIN_ODDS:.2f}\nFiltro de diferencia vs consenso: {MIN_EDGE*100:.1f}%\n"
         f"Deportes configurados: {', '.join(SPORTS[:MAX_SPORTS_PER_SCAN])}\n"
         f"Mercados consultados: {MARKETS}; región: {REGIONS}\n\n"
-        "No realiza apuestas ni garantiza ganancias. El escáner actual solo analiza los mercados configurados "
-        "en la fuente; no promete datos de córners, tarjetas, ambos marcan o goleadores."
+        "Mercados estándar: ganador, hándicap y over/under. Ambos marcan, córners, tarjetas y goleadores "
+        "solo estarán disponibles si tu proveedor y plan los ofrecen; no se inventan mercados ni cuotas."
     )
 
 
@@ -481,7 +507,7 @@ def main() -> None:
         log.warning("Falta ODDS_API_KEY: el bot seguirá disponible, pero no podrá escanear cuotas.")
     offset = 0
     last_scan = time.time()  # Wait one full interval after startup before automatic scan.
-    log.info("El Gran Golpe v1.4 + Gemini iniciado; intervalo %ss", POLL_SECONDS)
+    log.info("El Gran Golpe v1.5 + Gemini iniciado; intervalo automático %ss; modelo %s", POLL_SECONDS, GEMINI_MODEL)
     while True:
         try:
             updates = telegram("getUpdates", {
@@ -496,10 +522,10 @@ def main() -> None:
             message = str(exc)
             log.warning("Telegram polling: %s", message)
             if "409" in message or "Conflict" in message:
-                # A second getUpdates process is still active. Back off; the duplicate
-                # process must be stopped in Render before polling can work reliably.
-                log.error("409 Conflict: detén cualquier otro proceso/servicio con este mismo TELEGRAM_BOT_TOKEN.")
-                time.sleep(15)
+                # Telegram only allows one active getUpdates poller per bot token.
+                # Exit instead of endlessly retrying and hiding the duplicate process.
+                log.critical("409 Conflict: hay otro proceso usando este TELEGRAM_BOT_TOKEN. Detén el duplicado en Render o en tu equipo.")
+                raise SystemExit("Telegram 409: otro proceso está usando el mismo token.")
             else:
                 time.sleep(4)
 
