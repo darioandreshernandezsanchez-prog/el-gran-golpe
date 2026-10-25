@@ -1,4 +1,4 @@
-"""El Gran Golpe v1.6 — private Telegram sports-odds scanner with Gemini.
+"""El Gran Golpe v1.7 — API-Football statistical scanner with Gemini.
 Alerts are statistical screening signals, not guarantees. This bot never places bets.
 """
 from __future__ import annotations
@@ -20,6 +20,8 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 ODDS_API_KEY = os.getenv("ODDS_API_KEY", "").strip()
+API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY", "").strip()
+API_FOOTBALL_BASE = os.getenv("API_FOOTBALL_BASE", "https://v3.football.api-sports.io").rstrip("/")
 ODDS_API_BASE = os.getenv(
     "ODDS_API_BASE",
     os.getenv("ODDS_API_BASE_URL", "https://api.the-odds-api.com")
@@ -140,6 +142,83 @@ def fetch_sport(sport: str) -> list[dict[str, Any]]:
         raise ValueError(f"Respuesta inesperada de API para {sport}")
     return data
 
+
+# API-Football league IDs. The year/season availability depends on the competition.
+FOOTBALL_LEAGUES = {
+    "Premier League": 39, "La Liga": 140, "Bundesliga": 78, "Serie A": 135,
+    "Ligue 1": 61, "Eredivisie": 88, "Primeira Liga": 94,
+    "Champions League": 2, "Europa League": 3, "Conference League": 848,
+    "Championship": 40, "Scottish Premiership": 179,
+}
+
+def football_get(endpoint: str, params: dict[str, Any]) -> list[dict[str, Any]]:
+    if not API_FOOTBALL_KEY:
+        raise RuntimeError("Falta API_FOOTBALL_KEY en Render.")
+    query = urllib.parse.urlencode(params)
+    url = f"{API_FOOTBALL_BASE}/{endpoint.lstrip('/')}?{query}"
+    data = http_json(url, headers={"x-apisports-key": API_FOOTBALL_KEY, "User-Agent": "ElGranGolpe/1.6"})
+    if not isinstance(data, dict):
+        raise RuntimeError("Respuesta inesperada de API-Football.")
+    errors = data.get("errors")
+    if errors:
+        raise RuntimeError(f"API-Football: {str(errors)[:220]}")
+    response = data.get("response", [])
+    if not isinstance(response, list):
+        raise RuntimeError("API-Football no devolvió una lista de resultados.")
+    return response
+
+def football_stats_scan(chat_id: str | int) -> tuple[int, int, list[str]]:
+    """Statistical screening from recent league results; deliberately does not invent bookmaker odds."""
+    season = int(os.getenv("FOOTBALL_SEASON", str(datetime.now().year)))
+    leagues = list(FOOTBALL_LEAGUES.items())[:MAX_SPORTS_PER_SCAN]
+    errors: list[str] = []
+    signals: list[str] = []
+    checked = 0
+    for league_name, league_id in leagues:
+        try:
+            recent = football_get("fixtures", {"league": league_id, "season": season, "last": 20})
+            upcoming = football_get("fixtures", {"league": league_id, "season": season, "next": 10})
+            team_stats: dict[int, dict[str, float]] = {}
+            for item in recent:
+                fixture = item.get("fixture", {})
+                if fixture.get("status", {}).get("short") not in {"FT", "AET", "PEN"}:
+                    continue
+                teams = item.get("teams", {})
+                goals = item.get("goals", {})
+                home, away = teams.get("home", {}), teams.get("away", {})
+                hg, ag = goals.get("home"), goals.get("away")
+                if hg is None or ag is None:
+                    continue
+                for team, scored, conceded in ((home, hg, ag), (away, ag, hg)):
+                    tid = team.get("id")
+                    if tid is None: continue
+                    st = team_stats.setdefault(int(tid), {"n": 0, "gf": 0, "ga": 0, "scored": 0, "conceded": 0, "btts": 0, "over25": 0})
+                    st["n"] += 1; st["gf"] += scored; st["ga"] += conceded
+                    st["scored"] += int(scored > 0); st["conceded"] += int(conceded > 0)
+                    st["btts"] += int(scored > 0 and conceded > 0); st["over25"] += int(scored + conceded > 2)
+            for item in upcoming:
+                fixture = item.get("fixture", {})
+                if fixture.get("status", {}).get("short") not in {"NS", "TBD"}: continue
+                teams = item.get("teams", {})
+                home, away = teams.get("home", {}), teams.get("away", {})
+                hs, aws = team_stats.get(int(home.get("id", -1))), team_stats.get(int(away.get("id", -1)))
+                if not hs or not aws or hs["n"] < 3 or aws["n"] < 3: continue
+                checked += 1
+                hname, aname = home.get("name", "Local"), away.get("name", "Visitante")
+                btts_rate = ((hs["scored"] / hs["n"]) + (aws["scored"] / aws["n"]) + (hs["conceded"] / hs["n"]) + (aws["conceded"] / aws["n"])) / 4
+                over_rate = (hs["over25"] / hs["n"] + aws["over25"] / aws["n"]) / 2
+                if btts_rate >= 0.68:
+                    signals.append(f"⚽ {league_name}: {hname} vs {aname}\n📊 Ambos marcan: tendencia estadística alta ({btts_rate:.0%} indicador combinado).")
+                if over_rate >= 0.65:
+                    signals.append(f"📈 {league_name}: {hname} vs {aname}\nOver 2.5 goles: tendencia histórica ({over_rate:.0%} promedio de frecuencia de ambos equipos).")
+        except Exception as exc:
+            log.warning("API-Football fallo en %s: %s", league_name, exc)
+            errors.append(f"{league_name}: {str(exc)[:130]}")
+    for signal in signals[:15]:
+        send_message(chat_id, "📊 EL GRAN GOLPE · SEÑAL ESTADÍSTICA\n" + signal + "\n⚠️ No incluye cuotas reales ni garantiza resultados.")
+    summary = (f"🔎 Barrido estadístico API-Football terminado.\nLigas consultadas: {len(leagues)}\nPartidos próximos evaluados: {checked}\nSeñales estadísticas: {len(signals)}\nErrores de liga: {len(errors)}\n\nEste barrido analiza tendencias de goles/ambos marcan; no consulta cuotas de apuestas.")
+    send_message(chat_id, summary)
+    return len(signals), checked, errors
 
 def normalize_probs(outcomes: list[dict[str, Any]]) -> dict[tuple[str, str], float]:
     valid = []
@@ -446,7 +525,7 @@ def gemini_reply(user_request: str, chat_id: str | int) -> None:
 
 def help_text() -> str:
     return (
-        "🏁 EL GRAN GOLPE v1.5 + GEMINI\n\n"
+        "🏁 EL GRAN GOLPE v1.7 + GEMINI\n\n"
         "/start — activar mensajes en este chat\n/scan — consultar cuotas (consume créditos de la API)\n"
         "/pick_hoy — analizar el mejor candidato guardado\n/combo — combinada con señales guardadas\n"
         "/status — estado de configuración\n/results — rendimiento registrado\n"
@@ -454,8 +533,7 @@ def help_text() -> str:
         f"Cuota mínima: {MIN_ODDS:.2f}\nFiltro de diferencia vs consenso: {MIN_EDGE*100:.1f}%\n"
         f"Deportes configurados: {', '.join(SPORTS[:MAX_SPORTS_PER_SCAN])}\n"
         f"Mercados consultados: {MARKETS}; región: {REGIONS}\n\n"
-        "Mercados estándar: ganador, hándicap y over/under. Ambos marcan, córners, tarjetas y goleadores "
-        "solo estarán disponibles si tu proveedor y plan los ofrecen; no se inventan mercados ni cuotas."
+        "Con API-Football: tendencias estadísticas de goles/ambos marcan. No incluye cuotas reales. Córners/tarjetas requieren consulta de estadísticas adicional; no se inventan datos."
     )
 
 
@@ -478,7 +556,10 @@ def handle_update(update: dict[str, Any]) -> None:
     elif cmd == "/scan":
         send_message(chat_id, "Iniciando barrido… Ten en cuenta que consume créditos de cuotas.")
         try:
-            scan(chat_id)
+            if API_FOOTBALL_KEY:
+                football_stats_scan(chat_id)
+            else:
+                scan(chat_id)
         except Exception as exc:
             send_message(chat_id, f"No se pudo completar el barrido: {str(exc)[:500]}")
     elif cmd == "/combo":
@@ -488,7 +569,7 @@ def handle_update(update: dict[str, Any]) -> None:
     elif cmd == "/status":
         send_message(chat_id,
             f"Estado: bot en ejecución\nIntervalo automático: {POLL_SECONDS//60} min\n"
-            f"API cuotas: {'configurada' if ODDS_API_KEY else 'FALTA CLAVE'}\n"
+            f"API-Football: {'configurada' if API_FOOTBALL_KEY else 'FALTA CLAVE'}\nAPI cuotas antigua: {'configurada' if ODDS_API_KEY else 'no configurada'}\n"
             f"Gemini: {'configurada' if GEMINI_API_KEY else 'FALTA CLAVE'}\n"
             f"Token Telegram: {'configurado' if BOT_TOKEN else 'FALTA TOKEN'}\n"
             f"Deportes: {', '.join(SPORTS[:MAX_SPORTS_PER_SCAN])}\nMercados: {MARKETS}; región: {REGIONS}")
@@ -503,8 +584,8 @@ def handle_update(update: dict[str, Any]) -> None:
 def main() -> None:
     if not BOT_TOKEN:
         raise SystemExit("Falta TELEGRAM_BOT_TOKEN en Render.")
-    if not ODDS_API_KEY:
-        log.warning("Falta ODDS_API_KEY: el bot seguirá disponible, pero no podrá escanear cuotas.")
+    if not API_FOOTBALL_KEY and not ODDS_API_KEY:
+        log.warning("Faltan API_FOOTBALL_KEY y ODDS_API_KEY: el bot seguirá disponible, pero no podrá barrer datos deportivos.")
     offset = 0
     last_scan = time.time()  # Wait one full interval after startup before automatic scan.
     log.info("El Gran Golpe v1.6 + Gemini iniciado; intervalo automático %ss; modelo %s", POLL_SECONDS, GEMINI_MODEL)
@@ -536,9 +617,12 @@ def main() -> None:
         # Automatic scans are intentionally infrequent; set POLL_SECONDS in Render.
         # For free API limits, prefer 21600 (6 h) or disable automatic scanning by
         # leaving ODDS_API_KEY blank until the monthly quota resets.
-        if CHAT_ID and time.time() - last_scan >= POLL_SECONDS and ODDS_API_KEY:
+        if CHAT_ID and time.time() - last_scan >= POLL_SECONDS and (API_FOOTBALL_KEY or ODDS_API_KEY):
             try:
-                scan(CHAT_ID, report_summary=False)
+                if API_FOOTBALL_KEY:
+                    football_stats_scan(CHAT_ID)
+                else:
+                    scan(CHAT_ID, report_summary=False)
             except Exception:
                 log.exception("Barrido automático falló")
             last_scan = time.time()
