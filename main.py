@@ -1,5 +1,6 @@
-"""El Gran Golpe v1.8 Rápido — API-Football statistical scanner with Gemini.
-Alerts are statistical screening signals, not guarantees. This bot never places bets.
+"""El Gran Golpe v1.9 corregido — odds-first scanner with Gemini.
+Current picks require current odds; API-Football historical trends are a separate command.
+This bot never places bets and never invents fixtures or prices.
 """
 from __future__ import annotations
 
@@ -36,7 +37,7 @@ POLL_SECONDS = max(300, int(os.getenv("POLL_SECONDS", "21600")))
 MIN_ODDS = float(os.getenv("MIN_ODDS", "1.70"))
 MIN_EDGE = float(os.getenv("MIN_EDGE", "0.03"))
 MIN_BOOKMAKERS = max(2, int(os.getenv("MIN_BOOKMAKERS", "3")))
-MAX_SPORTS_PER_SCAN = max(1, int(os.getenv("MAX_SPORTS_PER_SCAN", "12")))
+MAX_SPORTS_PER_SCAN = max(1, int(os.getenv("MAX_SPORTS_PER_SCAN", "5")))
 DB_PATH = os.getenv("DB_PATH", "el_gran_golpe.sqlite3")
 REGIONS = os.getenv("ODDS_REGIONS", "eu")
 DEFAULT_SPORTS = (
@@ -89,7 +90,15 @@ def http_json(url: str, headers: dict[str, str] | None = None, timeout: int = 20
             detail = parsed.get("message") or parsed.get("error") or detail
         except Exception:
             pass
-        raise RuntimeError(f"HTTP {exc.code}: {str(detail)[:350]}") from None
+        if exc.code == 401:
+            detail = f"HTTP 401: clave inválida o cuota/plan no disponible. Detalle: {str(detail)[:240]}"
+        elif exc.code == 403:
+            detail = f"HTTP 403: el plan no permite este deporte/mercado/temporada. Detalle: {str(detail)[:240]}"
+        elif exc.code == 429:
+            detail = f"HTTP 429: límite de solicitudes alcanzado. Detalle: {str(detail)[:240]}"
+        else:
+            detail = f"HTTP {exc.code}: {str(detail)[:350]}"
+        raise RuntimeError(detail) from None
 
 
 def telegram(method: str, payload: dict[str, Any]) -> Any:
@@ -143,6 +152,14 @@ def fetch_sport(sport: str) -> list[dict[str, Any]]:
     return data
 
 
+def odds_error_stops_scan(error: Exception) -> bool:
+    """Do not waste remaining requests after invalid key/quota/rate-limit errors."""
+    message = str(error).casefold()
+    return any(token in message for token in (
+        "http 401", "unauthorized", "quota", "credits exhausted", "http 429", "rate limit"
+    ))
+
+
 # API-Football league IDs. The year/season availability depends on the competition.
 FOOTBALL_LEAGUES = {
     "Premier League": 39, "La Liga": 140, "Bundesliga": 78, "Serie A": 135,
@@ -169,7 +186,12 @@ def football_get(endpoint: str, params: dict[str, Any]) -> list[dict[str, Any]]:
 
 def football_stats_scan(chat_id: str | int) -> tuple[int, int, list[str]]:
     """Statistical screening from recent league results; deliberately does not invent bookmaker odds."""
-    season = int(os.getenv("FOOTBALL_SEASON", str(datetime.now().year)))
+    try:
+        season = int(os.getenv("FOOTBALL_SEASON", str(datetime.now().year)))
+    except ValueError:
+        raise RuntimeError("FOOTBALL_SEASON debe ser un año numérico, por ejemplo 2026.")
+    if season < 2000 or season > datetime.now().year + 1:
+        raise RuntimeError("FOOTBALL_SEASON no parece un año válido.")
     leagues = list(FOOTBALL_LEAGUES.items())[:MAX_SPORTS_PER_SCAN]
     errors: list[str] = []
     signals: list[str] = []
@@ -216,7 +238,7 @@ def football_stats_scan(chat_id: str | int) -> tuple[int, int, list[str]]:
             errors.append(f"{league_name}: {str(exc)[:130]}")
     for signal in signals[:15]:
         send_message(chat_id, "📊 EL GRAN GOLPE · SEÑAL ESTADÍSTICA\n" + signal + "\n⚠️ No incluye cuotas reales ni garantiza resultados.")
-    summary = (f"🔎 Barrido estadístico API-Football terminado.\nLigas consultadas: {len(leagues)}\nPartidos próximos evaluados: {checked}\nSeñales estadísticas: {len(signals)}\nErrores de liga: {len(errors)}\n\nEste barrido analiza tendencias de goles/ambos marcan; no consulta cuotas de apuestas.")
+    summary = (f"🔎 Análisis estadístico API-Football terminado.\nTemporada solicitada: {season}\nLigas consultadas: {len(leagues)}\nPartidos próximos evaluados: {checked}\nSeñales estadísticas: {len(signals)}\nErrores de liga: {len(errors)}\n\nNo consulta cuotas. Si tu plan no admite la temporada actual, el resultado no sirve para pronosticar partidos actuales; no se sustituyó por temporadas antiguas.")
     send_message(chat_id, summary)
     return len(signals), checked, errors
 
@@ -347,6 +369,9 @@ def scan(chat_id: str | int | None = None, report_summary: bool = True) -> tuple
         except Exception as exc:
             log.warning("Fallo en %s: %s", sport, exc)
             errors.append(f"{sport}: {str(exc)[:160]}")
+            if odds_error_stops_scan(exc):
+                log.error("Se detiene el barrido para no gastar más solicitudes: %s", exc)
+                break
     fresh = save_new_picks(all_picks)
     for pick in fresh[:20]:
         send_message(target, format_pick(pick))
@@ -527,8 +552,9 @@ def gemini_reply(user_request: str, chat_id: str | int) -> None:
 
 def help_text() -> str:
     return (
-        "🏁 EL GRAN GOLPE v1.8 RÁPIDO + GEMINI\n\n"
-        "/start — activar mensajes en este chat\n/scan — consultar cuotas (consume créditos de la API)\n"
+        "🏁 EL GRAN GOLPE v1.9 CORREGIDO + GEMINI\n\n"
+        "/start — activar mensajes en este chat\n/scan — barrido de cuotas actuales (consume créditos)\n"
+        "/stats — tendencias estadísticas API-Football (no son cuotas ni picks confirmados)\n"
         "/pick_hoy — analizar el mejor candidato guardado\n/combo — combinada con señales guardadas\n"
         "/status — estado de configuración\n/results — rendimiento registrado\n"
         "/settle ID won|lost|push — liquidar un pick manualmente\n/help — ayuda\n\n"
@@ -556,14 +582,23 @@ def handle_update(update: dict[str, Any]) -> None:
     elif cmd == "/help":
         send_message(chat_id, help_text())
     elif cmd == "/scan":
-        send_message(chat_id, "Iniciando barrido… Ten en cuenta que consume créditos de cuotas.")
-        try:
-            if API_FOOTBALL_KEY:
-                football_stats_scan(chat_id)
-            else:
+        if not ODDS_API_KEY:
+            send_message(chat_id, "No puedo buscar picks actuales: falta ODDS_API_KEY. /stats solo consulta tendencias históricas y no sustituye cuotas actuales.")
+        else:
+            send_message(chat_id, "🔎 Iniciando barrido de cuotas actuales. Esto consume créditos de The Odds API.")
+            try:
                 scan(chat_id)
-        except Exception as exc:
-            send_message(chat_id, f"No se pudo completar el barrido: {str(exc)[:500]}")
+            except Exception as exc:
+                send_message(chat_id, f"No se pudo completar el barrido: {str(exc)[:500]}")
+    elif cmd == "/stats":
+        if not API_FOOTBALL_KEY:
+            send_message(chat_id, "Falta API_FOOTBALL_KEY en Render.")
+        else:
+            send_message(chat_id, "📊 Iniciando tendencias estadísticas. No consulta cuotas ni genera picks confirmados.")
+            try:
+                football_stats_scan(chat_id)
+            except Exception as exc:
+                send_message(chat_id, f"No se pudo completar el análisis estadístico: {str(exc)[:400]}")
     elif cmd == "/combo":
         combo(chat_id)
     elif cmd == "/pick_hoy":
@@ -571,10 +606,12 @@ def handle_update(update: dict[str, Any]) -> None:
     elif cmd == "/status":
         send_message(chat_id,
             f"Estado: bot en ejecución\nIntervalo automático: {POLL_SECONDS//60} min\n"
-            f"API-Football: {'configurada' if API_FOOTBALL_KEY else 'FALTA CLAVE'}\nAPI cuotas antigua: {'configurada' if ODDS_API_KEY else 'no configurada'}\n"
-            f"Gemini: {'configurada' if GEMINI_API_KEY else 'FALTA CLAVE'}\n"
-            f"Token Telegram: {'configurado' if BOT_TOKEN else 'FALTA TOKEN'}\n"
-            f"Deportes: {', '.join(SPORTS[:MAX_SPORTS_PER_SCAN])}\nMercados: {MARKETS}; región: {REGIONS}")
+            f"API-Football: {'clave presente' if API_FOOTBALL_KEY else 'FALTA CLAVE'}\n"
+            f"The Odds API: {'clave presente' if ODDS_API_KEY else 'FALTA CLAVE'}\n"
+            f"Gemini: {'clave presente' if GEMINI_API_KEY else 'FALTA CLAVE'}\n"
+            f"Telegram: {'token presente' if BOT_TOKEN else 'FALTA TOKEN'}\n"
+            f"Deportes por barrido: {', '.join(SPORTS[:MAX_SPORTS_PER_SCAN])}\nMercados: {MARKETS}; región: {REGIONS}\n"
+            "Nota: clave presente no confirma cuota disponible ni permisos de temporada.")
     elif cmd == "/results":
         send_message(chat_id, performance())
     elif cmd == "/settle":
@@ -590,7 +627,7 @@ def main() -> None:
         log.warning("Faltan API_FOOTBALL_KEY y ODDS_API_KEY: el bot seguirá disponible, pero no podrá barrer datos deportivos.")
     offset = 0
     last_scan = time.time()  # Wait one full interval after startup before automatic scan.
-    log.info("El Gran Golpe v1.8 Rápido + Gemini iniciado; intervalo automático %ss; modelo %s", POLL_SECONDS, GEMINI_MODEL)
+    log.info("El Gran Golpe v1.9 corregido + Gemini iniciado; intervalo automático %ss; modelo %s", POLL_SECONDS, GEMINI_MODEL)
     while True:
         try:
             updates = telegram("getUpdates", {
@@ -607,26 +644,24 @@ def main() -> None:
             if "409" in message or "Conflict" in message:
                 # Avoid crashing and triggering a Render restart loop. Telegram still
                 # permits only one getUpdates poller per token; back off and retry slowly.
-                log.error(
+                log.critical(
                     "Telegram 409: otro proceso está usando el mismo token. "
-                    "Se pausa 60 s para evitar un ciclo de reinicios; el conflicto externo "
-                    "debe desaparecer para que este bot reciba mensajes."
+                    "Este error no se corrige desde la API deportiva: deja una sola instancia "
+                    "de Render y cierra cualquier ejecución local/servicio duplicado."
                 )
-                time.sleep(60)
+                raise SystemExit("Telegram 409: poller duplicado; detener instancia duplicada.")
             else:
                 time.sleep(4)
 
         # Automatic scans are intentionally infrequent; set POLL_SECONDS in Render.
         # For free API limits, prefer 21600 (6 h) or disable automatic scanning by
         # leaving ODDS_API_KEY blank until the monthly quota resets.
-        if CHAT_ID and time.time() - last_scan >= POLL_SECONDS and (API_FOOTBALL_KEY or ODDS_API_KEY):
+        if CHAT_ID and time.time() - last_scan >= POLL_SECONDS and ODDS_API_KEY:
             try:
-                if API_FOOTBALL_KEY:
-                    football_stats_scan(CHAT_ID)
-                else:
-                    scan(CHAT_ID, report_summary=False)
+                # Automatic picks always come from current odds, never from old-season stats.
+                scan(CHAT_ID, report_summary=False)
             except Exception:
-                log.exception("Barrido automático falló")
+                log.exception("Barrido automático de cuotas falló")
             last_scan = time.time()
 
 
