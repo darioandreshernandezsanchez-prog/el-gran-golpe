@@ -1,4 +1,4 @@
-"""El Gran Golpe v1.7 — API-Football statistical scanner with Gemini.
+"""El Gran Golpe v1.8 Rápido — API-Football statistical scanner with Gemini.
 Alerts are statistical screening signals, not guarantees. This bot never places bets.
 """
 from __future__ import annotations
@@ -463,18 +463,17 @@ def gemini_reply(user_request: str, chat_id: str | int) -> None:
 
     # Do not block Gemini just because the odds API has no saved picks.
     # For betting requests, explicitly forbid invented odds/picks.
+    # Prompt compacto para reducir tokens y evitar que Gemini afirme haber consultado datos no conectados.
     prompt = (
-        "Eres el asistente de análisis deportivo El Gran Golpe. Responde en español, breve y directo. "
-        "Puedes responder preguntas generales y explicar deportes, reglas, mercados y conceptos. "
-        "Si el usuario pide una apuesta, pick, pronóstico actual o combinada, usa EXCLUSIVAMENTE "
-        "los candidatos reales del JSON. No inventes partidos actuales, cuotas, lesiones, estadísticas "
-        "ni disponibilidad de mercados. Si el JSON está vacío o no contiene una opción adecuada, dilo "
-        "claramente y no propongas una apuesta ficticia. No garantices ganancias ni llames segura a una apuesta. "
-        "No digas que has consultado cuotas en vivo salvo que estén en el JSON. "
-        "Aclara brevemente que las cuotas cambian y que el análisis no garantiza resultados.\n\n"
-        f"Es una solicitud de apuestas: {'sí' if betting_request else 'no'}.\n"
-        f"Solicitud del usuario: {user_request[:1200]}\n\n"
-        f"Candidatos reales guardados (JSON; puede estar vacío): {json.dumps(candidates, ensure_ascii=False)}"
+        "Eres El Gran Golpe, asistente de análisis deportivo. Español, breve y directo. "
+        "Preguntas generales: explica conceptos sin fingir que consultaste datos actuales. "
+        "Para picks/pronósticos/combinadas, usa SOLO los candidatos reales del JSON. "
+        "No inventes partidos, cuotas, lesiones ni estadísticas. Si no hay candidatos adecuados, "
+        "dilo claramente y no inventes una apuesta. Describe métodos en condicional (revisaría) "
+        "salvo que los datos realmente estén disponibles. Nunca garantices ganancias.\n"
+        f"Solicitud de apuestas: {'sí' if betting_request else 'no'}. "
+        f"Usuario: {user_request[:800]}\n"
+        f"Candidatos guardados: {json.dumps(candidates[:20], ensure_ascii=False, separators=(',', ':'))}"
     )
     url = (
         "https://generativelanguage.googleapis.com/v1beta/models/"
@@ -482,32 +481,35 @@ def gemini_reply(user_request: str, chat_id: str | int) -> None:
     )
     payload = json.dumps({
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.25, "maxOutputTokens": 800}
+        "generationConfig": {"temperature": 0.25, "maxOutputTokens": 350}
     }).encode("utf-8")
     req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"}, method="POST")
     data = None
     last_error = "error desconocido"
-    for attempt in range(3):
+    started_at = time.monotonic()
+    for attempt in range(2):
         try:
-            with urllib.request.urlopen(req, timeout=22) as resp:
+            with urllib.request.urlopen(req, timeout=12) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
             break
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
             last_error = f"HTTP {exc.code}: {body[:350]}"
-            log.warning("Fallo Gemini intento %s/3: %s", attempt + 1, last_error)
-            if exc.code not in (429, 500, 502, 503, 504) or attempt == 2:
+            log.warning("Fallo Gemini intento %s/2: %s", attempt + 1, last_error)
+            if exc.code not in (429, 500, 502, 503, 504) or attempt == 1:
                 break
         except Exception as exc:
             last_error = str(exc)
-            log.warning("Fallo Gemini intento %s/3: %s", attempt + 1, last_error)
-            if attempt == 2:
+            log.warning("Fallo Gemini intento %s/2: %s", attempt + 1, last_error)
+            if attempt == 1:
                 break
-        time.sleep(1.5 * (attempt + 1))
+        time.sleep(0.25)
 
+    elapsed = time.monotonic() - started_at
+    log.info("Gemini terminó en %.2f s (modelo=%s)", elapsed, GEMINI_MODEL)
     if data is None:
         log.error("Gemini no respondió tras reintentos: %s", last_error)
-        send_message(chat_id, f"Gemini no respondió tras 3 intentos ({last_error[:180]}). Comprueba GEMINI_API_KEY y GEMINI_MODEL en Render.")
+        send_message(chat_id, f"Gemini no respondió tras 2 intentos ({last_error[:180]}). Comprueba GEMINI_API_KEY y GEMINI_MODEL en Render.")
         return
     try:
         parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
@@ -525,7 +527,7 @@ def gemini_reply(user_request: str, chat_id: str | int) -> None:
 
 def help_text() -> str:
     return (
-        "🏁 EL GRAN GOLPE v1.7 + GEMINI\n\n"
+        "🏁 EL GRAN GOLPE v1.8 RÁPIDO + GEMINI\n\n"
         "/start — activar mensajes en este chat\n/scan — consultar cuotas (consume créditos de la API)\n"
         "/pick_hoy — analizar el mejor candidato guardado\n/combo — combinada con señales guardadas\n"
         "/status — estado de configuración\n/results — rendimiento registrado\n"
@@ -588,7 +590,7 @@ def main() -> None:
         log.warning("Faltan API_FOOTBALL_KEY y ODDS_API_KEY: el bot seguirá disponible, pero no podrá barrer datos deportivos.")
     offset = 0
     last_scan = time.time()  # Wait one full interval after startup before automatic scan.
-    log.info("El Gran Golpe v1.6 + Gemini iniciado; intervalo automático %ss; modelo %s", POLL_SECONDS, GEMINI_MODEL)
+    log.info("El Gran Golpe v1.8 Rápido + Gemini iniciado; intervalo automático %ss; modelo %s", POLL_SECONDS, GEMINI_MODEL)
     while True:
         try:
             updates = telegram("getUpdates", {
